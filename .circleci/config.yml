@@ -1,49 +1,437 @@
 # Use the latest 2.1 version of CircleCI pipeline process engine.
 # See: https://circleci.com/docs/2.0/configuration-reference
 version: 2.1
-
+orbs:
+  maven: circleci/maven@1.4.1
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
 jobs:
   # Below is the definition of your job to build and test your app, you can rename and customize it as you want.
-  build-and-test:
-    # These next lines define a Docker executor: https://circleci.com/docs/2.0/executor-types/
-    # You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
-    # Be sure to update the Docker image tag below to openjdk version of your application.
-    # A list of available CircleCI Docker Convenience Images are available here: https://circleci.com/developer/images/image/cimg/openjdk
-    docker:
-      - image: cimg/openjdk:11.0
-    # Add steps to the job
-    # See: https://circleci.com/docs/2.0/configuration-reference/#steps
-    steps:
-      # Checkout the code as the first step.
-      - checkout
-      # Use mvn clean and package as the standard maven build phase
-      - run:
-          name: Build
-          command: mvn -B -DskipTests clean package
-      # Then run your tests!
-      - run:
-          name: Test
-          command: mvn test
-      - run:
-          name: Creating Dummy Artifacts
-          command: |
-            echo "my artifact file" > /tmp/artifact-1;
-            mkdir /tmp/artifacts;
-            echo "my artifact files in a dir" > /tmp/artifacts/artifact-2;
 
-      - store_artifacts:
-          path: /tmp/artifact-1
-          destination: artifact-file
-
-      - store_artifacts:
-          path: /tmp/artifacts
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
-
 workflows:
-  sample: # This is the name of the workflow, feel free to change it to better match your workflow.
-    # Inside the workflow, you define the jobs you want to run.
+  version: 2.1
+  verify_and_build:
     jobs:
-      - build-and-test
+      - maven-build/docker_build:
+          context: maven-build
+          pre-steps:
+            - run:
+                name: Setting environment vars
+                command: |
+                  echo "Set environment vars"# This code is licensed from CircleCI to the user under the MIT license.
+# See here for details: https://circleci.com/developer/orbs/licensing
+---
+version: 2.1
+
+description: |
+  Orb for verifying, building and releasing Maven projects at InClassToday. The build will perform the following steps,
+  optionally running docker compose prior to the verification step:
+    1. Resolve maven dependencies (using a cache based on all pom files within the project)
+    2. Verify that all tests and validations pass by running mvn clean install (optionally in a secondary container with
+      dependent services exposed through docker-compose networking).
+    3. Prepare the next firm release via mvn clean release:prepare (if on the master or main branch)
+    4. Perform the next firm release via mvn clean release:perform (if on the master or main branch)
+    5. Cut a new snapshot release and deploy to nexus
+
+  The default executor uses the maven:3-jdk-12-alpine docker image. This may be overridden in individual project configs but we
+  do not recommend doing so.
+source: https://github.com/InClassToday/circleci-orbs
+
+examples:
+  standard_maven_build:
+    description: |
+      Build a standard maven project in the primary container with no docker-compose dependencies or custom environment
+      variables.
+    usage:
+      version: 2.1
+
+      orbs:
+        maven-build: inclasstoday/maven-build@X.Y.Z
+      workflows:
+        version: 2.1
+        verify_and_build:
+          jobs:
+            - maven-build/docker_build:
+                context: maven-build
+
+  maven_build_with_docker_compose:
+    description: |
+      Build a maven project in a secondary container with docker-compose dependencies, docker volume resources and custom
+      environment variables.
+    usage:
+      version: 2.1
+
+      orbs:
+        maven-build: inclasstoday/maven-build@X.Y.Z
+      workflows:
+        version: 2.1
+        verify_and_build:
+          jobs:
+            - maven-build/docker_build:
+                context: maven-build
+                pre-steps:
+                  - run:
+                      name: Setting environment vars
+                      command: |
+                        echo "Set environment vars"
+                        printenv >> ${BASH_ENV}
+                      environment:
+                        - DB_HOST: postgres
+                        - SFTP_HOST: sftp-container
+                with_docker: true
+                copy_docker_resources: docker
+                run_docker_compose: true
+
+# This section contains YAML aliases which can be reused throughout the orb. These are also replicated in environment variables
+# so that we can reference them in bash commands as well.
+references:
+  # The fully qualified name of the docker image in our repository
+  - &build_image 398715117576.dkr.ecr.us-east-1.amazonaws.com/maven-build:0.1.0
+  # The name of the secondary build container to be created for docker-enabled builds
+  - &build_container_name build-container
+  # The name of the file containing environment variables for docker-enabled builds
+  - &docker_env_file /tmp/.docker_env
+  # The name of the project used by docker-compose
+  - &docker_compose_project_name ${CIRCLE_PROJECT_REPONAME}-build
+  # The name of the docker network used by docker-compose and the secondary build container
+  - &docker_network_name ${CIRCLE_PROJECT_REPONAME}-build_default
+  # The directory containing our maven dependencies
+  - &maven_home /root/.m2/
+  # The directory in which the project code will be checked out and the build executed
+  - &project_home /root/project/
+  # The name of the key to use for the project code cache. Uniquely identified by repo name, branch name and revision hash.
+  - &repo_cache_key v1-repo-{{ .Environment.CIRCLE_PROJECT_REPONAME }}-{{ .Branch }}-{{ .Revision }}
+  # The name of the key used for the maven dependency cache. Uniquely identified by repo name and
+  # checksum of all project poms.
+  - &poms_cache_key v1-{{ .Environment.CIRCLE_PROJECT_REPONAME }}-maven-dependencies-{{ checksum "/tmp/maven-checksum.txt" }}
+  # the generic, project-level maven dependency cache which will be used as a fallback if the exact
+  # cache for the checksum of the pom(s) is not found.
+  - &maven_cache_key v1-{{ .Environment.CIRCLE_PROJECT_REPONAME }}-maven-dependencies-
+
+executors:
+  maven3_jdk16:
+    docker:
+      - image: *build_image
+        aws_auth:
+          aws_access_key_id: ${AWS_ACCESS_KEY_ID}
+          aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+    working_directory: *project_home
+
+commands:
+  build_step_container_setup:
+    description: Steps to set up and run a secondary docker container to perform build steps
+    steps:
+      - run:
+          name: Dump environment into file for secondary container
+          command: |
+            cat <(printenv) ${BASH_ENV} | sort -u > ${DOCKER_ENV_FILE}
+      - run:
+          name: Spin up secondary docker container for the build
+          command: |
+            docker run --network ${DOCKER_NETWORK_NAME} \
+              --name ${BUILD_CONTAINER_NAME} \
+              --env-file ${DOCKER_ENV_FILE} \
+              -idt ${BUILD_IMAGE} bin/bash
+      - run:
+          name: Copy project files into build container
+          command: docker cp ${PROJECT_HOME}. build-container:${PROJECT_HOME}
+      - run:
+          name: Copy maven dependencies into build container
+          command: docker cp ${MAVEN_HOME}. build-container:${MAVEN_HOME}
+
+  docker_setup:
+    description: Set up docker and docker-compose (if enabled) on the container
+    parameters:
+      copy_docker_resources:
+        description: Name of a docker resources folder to copy to the remote docker host (for mounting volumes).
+        type: string
+        default: ""
+      run_docker_compose:
+        description: Whether to run docker-compose up
+        type: boolean
+        default: false
+    steps:
+      - run:
+          name: Login to ECR docker registry
+          command: $(aws ecr get-login --region ${AWS_REGION} --no-include-email)
+      - setup_remote_docker:
+          version: 20.10.6 # this is the version of the docker client installed in our build image
+      - when:
+          condition: << parameters.copy_docker_resources >>
+          steps:
+            - run:
+                name: Copy docker resources to remote docker host.
+                command: |
+                  echo Resource to copy: << parameters.copy_docker_resources >>
+                  scp -rp ./<< parameters.copy_docker_resources >>/ remote-docker:/home/circleci/
+                  ssh remote-docker sudo mkdir -p ${PROJECT_HOME}
+                  ssh remote-docker sudo mv /home/circleci/<< parameters.copy_docker_resources >> ${PROJECT_HOME}
+      - when:
+          condition: << parameters.run_docker_compose >>
+          steps:
+            - run:
+                name: Run docker-compose up
+                command: docker-compose --project-name=${DOCKER_COMPOSE_PROJECT_NAME} up -d
+      - unless:
+          condition: << parameters.run_docker_compose >>
+          steps:
+            - run:
+                name: Create docker network
+                command: docker network create ${DOCKER_NETWORK_NAME}
+      - build_step_container_setup
+
+  restore_project_repo:
+    description: |
+      Attempt to restore the checked out code for this branch and revision of the repository.
+      Check out a fresh copy if the cache is not found. See https://circleci.com/docs/2.0/caching
+    steps:
+      - restore_cache:
+          key: *repo_cache_key
+      # checkout should be a noop if the cache exists
+      - checkout
+
+  save_project_repo:
+    description: Save a cache of the checked out code for this branch and revision of the repository
+    steps:
+      - save_cache:
+          key: *repo_cache_key
+          paths:
+            - *project_home
+
+  generate_maven_checksum:
+    description: Generate a checksum of the main project pom and any sub-module poms
+    steps:
+      - run:
+          name: Create a file containing a checksum of all pom.xml files in the project as well as the executor type.
+          command: |
+            sha1sum pom.xml **/pom.xml > /tmp/maven-checksum.txt || true
+            echo "executor: ${EXECUTOR_TYPE}" >> /tmp/maven-checksum.txt
+          when: always
+
+  save_maven_dependencies:
+    description: |
+      Persist maven dependencies. Cache key uses a combined checksum of the main pom and any
+      sub-module poms.
+    steps:
+      - generate_maven_checksum
+      - save_cache:
+          when: always
+          key: *poms_cache_key
+          paths:
+            - *maven_home
+
+
+  restore_maven_dependencies:
+    description: |
+      Restore cached maven dependencies. Cache key uses a combined checksum of the main
+      pom and any sub-module poms. If the key for the checksum is not found, CircleCI will pull the
+      latest cache with the project prefix. See https://circleci.com/docs/2.0/caching
+    steps:
+      - generate_maven_checksum
+      - restore_cache:
+          keys:
+            # circleci will first check for a cache of the exact checksum of the pom(s) for this
+            # branch and if not found will revert to the latest cache from the project based on the
+            # prefix. This avoids a cache miss and time consuming download of dependencies every
+            # time the pom is updated (i.e. between every release).
+            # See https://circleci.com/docs/2.0/caching
+            - *poms_cache_key
+            - *maven_cache_key
+      - run:
+          name: Resolve maven dependencies
+          # for some reason this command doesn't download all of our maven plugins (most notably
+          # sonar). this means that we can't run our subsequent maven commands in offline mode, but
+          # this step downloads most of our dependencies and we can cache the remaining ones that
+          # are downloaded during the build by copying them from the docker container.
+          command: |
+            mvn dependency:resolve-plugins dependency:go-offline
+
+  default_setup:
+    description: Collection of setup tasks shared by all jobs
+    steps:
+      - restore_project_repo
+      - save_project_repo
+      - generate_maven_checksum
+      - restore_maven_dependencies
+
+  maven_command:
+    description: Run a maven command.
+    parameters:
+      command:
+        description: The maven command to execute.
+        type: string
+      branch_filter:
+        description: Only execute the command if the current branch matches the given regular expression
+        type: string
+        default: '^.*$'
+      with_docker:
+        description: Whether to run the maven command in a secondary docker container
+        type: boolean
+        default: false
+    steps:
+      - when:
+          condition: << parameters.with_docker >>
+          steps:
+            - run:
+                name: Run maven command in secondary docker container
+                command: |
+                  [[ "$(git rev-parse --abbrev-ref HEAD)" =~ << parameters.branch_filter>> ]] && \
+                    docker exec \
+                      --workdir ${PROJECT_HOME} \
+                      ${BUILD_CONTAINER_NAME} \
+                      mvn << parameters.command >>
+      - unless:
+          condition: << parameters.with_docker >>
+          steps:
+            - run:
+                name: Run maven command in the primary build container
+                command: |
+                  git_branch=$(git rev-parse --abbrev-ref HEAD)
+                  if [[ "${git_branch}" =~ << parameters.branch_filter>> ]]
+                  then
+                    mvn << parameters.command >>
+                  else
+                    echo "Not running maven command because branch ${git_branch} does not match branch filter << parameters.branch_filter>>"
+                  fi
+
+jobs:
+  docker_build:
+    executor: maven3_jdk16
+    parameters:
+      with_docker:
+        description: Run maven tests in a secondary build container with docker compose.
+        type: boolean
+        default: false
+      copy_docker_resources:
+        description: Name of a docker resources folder to copy to the remote docker host (for mounting volumes).
+        type: string
+        default: ""
+      run_docker_compose:
+        description: Whether to run docker-compose up
+        type: boolean
+        default: false
+      run_sonar:
+        description: |
+          Whether to run sonar plugin. At the time of writing this, we are paying 10 euro for
+          a sonar plan that covers 100,000 lines of code.
+
+            https://sonarcloud.io/organizations/everydaylabs/billing
+
+          To delay the day when we need to upgrade to a higher priced plan, we can delete projects
+          in our sonar account that are deprecated, obsolete or don't make sense to scan with
+          sonar. However, if those projects still run in circleci from time to time, we can set
+          this to false to avoid the build failing with a sonar-maven-plugin error like:
+
+            Could not find a default branch to fall back on.
+
+        type: boolean
+        default: true
+    environment:
+      - EXECUTOR_TYPE: docker
+      - BUILD_IMAGE: *build_image
+      - BUILD_CONTAINER_NAME: *build_container_name
+      - DOCKER_ENV_FILE: *docker_env_file
+      - DOCKER_COMPOSE_PROJECT_NAME: *docker_compose_project_name
+      - DOCKER_NETWORK_NAME: *docker_network_name
+      - MAVEN_HOME: *maven_home
+      - PROJECT_HOME: *project_home
+
+    steps:
+      - default_setup
+      - when:
+          condition: << parameters.with_docker >>
+          steps:
+            - docker_setup:
+                copy_docker_resources: << parameters.copy_docker_resources >>
+                run_docker_compose: <<parameters.run_docker_compose >>
+      # run clean install w/o dockerfile goal to hit all tests etc (runs in secondary container if configured to do so)
+      - maven_command:
+          command: |
+            clean install -Ddockerfile.skip
+          with_docker: << parameters.with_docker >>
+      # TODO: pass sonar.pullrequest.base in case the PR is not against master or main branch
+      - when:
+          condition: << parameters.run_sonar >>
+          steps:
+            - maven_command:
+                command: |
+                  sonar:sonar \
+                      -Dsonar.login=${SONAR_TOKEN} \
+                      $(if [[ -n "${CIRCLE_PULL_REQUEST}" ]]; then echo -Dsonar.pullrequest.branch=${CIRCLE_BRANCH} \
+                        -Dsonar.pullrequest.key=${CIRCLE_PULL_REQUEST##*/}; fi)
+                with_docker: << parameters.with_docker >>
+      # Copy build directories (i.e. target/) back to primary container so we can archive files
+      # like test output
+      - when:
+          condition: << parameters.with_docker >>
+          steps:
+            - run:
+                name: 'Copy secondary build container files back to primary build container'
+                # If the maven build fails because of a test failure, we definitely still want this step
+                # to run so that we can look at the logs for failed tests
+                when: always
+                # The /. at the end of build-container:${PROJECT_HOME}/. is important here. It triggers
+                # the copy semantics of recursively copying contents of a folder. That is, existing items
+                # remain and missing items are added (e.g. target/)
+                command: docker cp build-container:${PROJECT_HOME}/. ${PROJECT_HOME}
+      - run:
+          name: 'Gather test results into a single directory'
+          # If the maven build fails because of a test failure, we definitely still want this step
+          # to run so that we can look at the logs for failed tests
+          when: always
+          # In a project with maven sub-modules, there may be multiple files in the directory
+          # structure with the same name (e.g. multiple sub-modules with integration tests may
+          # have a target/failsafe-reports/failsafe-summary.xml). Adding --backup=numbered means
+          # that they will get copied to /tmp/test_files as:
+          # failsafe-summary.xml, failsafe-summary.xml.~1~  failsafe-summary.xml.~2~, etc.
+          # That way we have all files and this step doesn't fail the CI pipeline.
+          #
+          # Also, the slash at the end of {}/ is important because it causes the contents of
+          # the found directory to be copied instead of the actual director itself
+          command: |
+            mkdir /tmp/test_files
+            find ${PROJECT_HOME} -type d -name surefire-reports \
+              -exec cp --backup=numbered -R {}/ /tmp/test_files/ \;
+            find ${PROJECT_HOME} -type d -name failsafe-reports \
+              -exec cp --backup=numbered -R {}/ /tmp/test_files/ \;
+      # It would be cool if we could use CircleCI's store_test_results step too to generate a
+      # fancy test failures UI for each build, but it doesn't play well with maven submodules.
+      # store_test_results expects to be passed one folder with test results, but in a maven
+      # project with submodules, there are multiple target folders all with their own test results
+      - store_artifacts:
+          path: /tmp/test_files
+      # prepare the release if we are on the master or main branch
+      - maven_command:
+          branch_filter: ^(master|main)$
+          command: |
+            clean release:prepare \
+            -Darguments="-DskipTests -Dcheckstyle.skip -Dspotbugs.skip -Djavadoc.skip -Dmdep.analyze.skip" \
+            --batch-mode
+      # perform the release if we are on the master or main branch
+      - maven_command:
+          branch_filter: ^(master|main)$
+          command: |
+            clean release:perform \
+            -Darguments="-DskipTests -Dcheckstyle.skip -Dspotbugs.skip -Djavadoc.skip -Dmdep.analyze.skip" \
+            --batch-mode
+      # always release the latest snapshot
+      - maven_command:
+          command: clean deploy -DskipTests
+      - when:
+          condition: << parameters.with_docker >>
+          steps:
+            - run:
+                name: 'Download maven deps from build container'
+                when: always
+                command: docker cp build-container:${MAVEN_HOME}/. ${MAVEN_HOME}
+      - save_maven_dependencies
+
+                  printenv >> ${BASH_ENV}
+                environment:
+                  - DB_HOST: postgres
+                  - SFTP_HOST: sftp-container
+          with_docker: true
+          copy_docker_resources: docker
+          run_docker_compose: true
