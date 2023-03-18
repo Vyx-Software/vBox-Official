@@ -6,13 +6,20 @@ orbs:
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
   # Below is the definition of your job to build and test your app, you can rename and customize it as you want.
-  
+jobs:
+  example-job:
+    docker:
+      # replace with your preferred image
+      - image: cimg/base:stable
+    steps:
+      - maven-build/docker_setup
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
 
 workflows:
     example-workflow:
       jobs:
+        - example-job
         - maven-build/docker_build:
             with_docker: true 
             run_docker_compose: true 
