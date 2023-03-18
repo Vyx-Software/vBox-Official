@@ -2,7 +2,7 @@
 # See: https://circleci.com/docs/2.0/configuration-reference
 version: 2.1
 orbs:
-  circleci-maven-release-orb: sonatype-nexus-community/circleci-maven-release-orb@0.0.18
+  maven-build: inclasstoday/maven-build@1.0.10
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
   # Below is the definition of your job to build and test your app, you can rename and customize it as you want.
@@ -13,4 +13,7 @@ orbs:
 workflows:
     example-workflow:
       jobs:
-        - circleci-maven-release-orb/run-maven-release
+        - maven-build/docker_build:
+            with_docker: true 
+            run_docker_compose: true 
+            run_sonar: true 
